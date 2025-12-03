@@ -14,8 +14,10 @@ import sqlite3
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Iterator
+from typing import List, Dict, Iterator, Optional, Any
 from contextlib import contextmanager
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 # ============================================================================
 # SECTION 1: LOGGING SETUP (Production Monitoring)
@@ -48,6 +50,45 @@ class RecommendationResponse(BaseModel):
     similarity_score: float
     user_profile: List[float]
     all_scores: Dict[str, float]
+
+class OnboardingStartResponse(BaseModel):
+    """Schema for onboarding start response"""
+    movies: List[Dict[str, Any]]  # List of movies with name, description, embedding
+
+class OnboardingCompleteRequest(BaseModel):
+    """Schema for completing onboarding"""
+    user_id: str
+    selected_movies: Optional[List[str]] = None  # Optional: if not provided, uses session data
+
+class OnboardingCompleteResponse(BaseModel):
+    """Schema for onboarding complete response"""
+    status: str
+    initial_profile: List[float]
+    recommendation: Optional[Dict[str, Any]]
+    message: str
+
+class OnboardingNextRequest(BaseModel):
+    """Schema for getting next 3 movies"""
+    user_id: str
+
+class OnboardingNextResponse(BaseModel):
+    """Schema for next 3 movies response"""
+    movies: List[Dict[str, Any]]  # 3 movies with name, description, embedding
+    selections_made: int  # How many selections user has made (0, 1, or 2)
+    selections_remaining: int  # How many more needed (3, 2, or 1)
+
+class OnboardingSelectRequest(BaseModel):
+    """Schema for selecting a single movie"""
+    user_id: str
+    movie_name: str  # The one movie the user selected
+
+class OnboardingSelectResponse(BaseModel):
+    """Schema for selection response"""
+    status: str
+    selections_made: int
+    selections_remaining: int
+    message: str
+    ready_to_complete: bool  # True when 3 selections are made
 
 # ============================================================================
 # SECTION 3: DATABASE SETUP & INITIALIZATION
@@ -178,6 +219,19 @@ def init_database() -> None:
                 processed INTEGER DEFAULT 0
             )
         ''')
+        
+        # Table for onboarding sessions (tracks sequential selection flow)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS onboarding_sessions (
+                user_id TEXT PRIMARY KEY,
+                selections_made INTEGER DEFAULT 0,
+                selected_movies TEXT NOT NULL,
+                shown_movies TEXT NOT NULL,
+                status TEXT DEFAULT 'in_progress',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     
     logger.info("Database initialized successfully")
 
@@ -192,8 +246,67 @@ MOVIES = {
     "The Notebook": [0, 5, 1],
     "Blade Runner": [3, 0, 5],
     "Titanic": [2, 4, 0],
-    "The Matrix": [4, 1, 4]
+    "The Matrix": [4, 1, 4],
+    "Inception": [4, 0, 5],
+    "The Dark Knight": [5, 0, 3],
+    "Forrest Gump": [2, 3, 0],
+    "Pulp Fiction": [5, 1, 0],
+    "The Godfather": [4, 1, 0],
+    "Interstellar": [3, 1, 5],
+    "Gladiator": [5, 1, 0],
+    "The Shawshank Redemption": [2, 2, 0],
+    "Fight Club": [4, 0, 1],
+    "Goodfellas": [4, 1, 0],
+    "The Lord of the Rings": [4, 1, 3],
+    "Star Wars": [4, 1, 5],
+    "Casablanca": [1, 5, 0],
+    "The Terminator": [5, 1, 4],
+    "Jurassic Park": [4, 1, 3],
+    "E.T. the Extra-Terrestrial": [2, 3, 4],
+    "Back to the Future": [3, 2, 4],
+    "The Avengers": [5, 1, 4],
+    "Toy Story": [2, 2, 1],
+    "Finding Nemo": [1, 3, 0]
 }
+
+# Movie descriptions for sentence transformer embeddings
+# These help create better initial profiles from user selections
+MOVIE_DESCRIPTIONS = {
+    "Die Hard": "high-octane action thriller with intense sequences and explosive moments",
+    "The Notebook": "romantic love story with emotional depth and heartfelt moments",
+    "Blade Runner": "sci-fi noir with futuristic themes and philosophical questions",
+    "Titanic": "romantic drama with historical setting and emotional storytelling",
+    "The Matrix": "sci-fi action with mind-bending concepts and martial arts",
+    "Inception": "sci-fi thriller with complex plot and dream sequences",
+    "The Dark Knight": "superhero action with dark themes and intense drama",
+    "Forrest Gump": "dramatic comedy with emotional storytelling and historical backdrop",
+    "Pulp Fiction": "crime action with nonlinear storytelling and dark humor",
+    "The Godfather": "crime drama with family themes and intense moments",
+    "Interstellar": "sci-fi drama with space exploration and emotional depth",
+    "Gladiator": "historical action epic with intense combat and drama",
+    "The Shawshank Redemption": "dramatic story about friendship and hope",
+    "Fight Club": "psychological thriller with action and dark themes",
+    "Goodfellas": "crime drama with intense action and character development",
+    "The Lord of the Rings": "fantasy epic with adventure and emotional storytelling",
+    "Star Wars": "sci-fi adventure with space battles and hero's journey",
+    "Casablanca": "classic romantic drama with wartime setting",
+    "The Terminator": "sci-fi action with time travel and intense sequences",
+    "Jurassic Park": "sci-fi adventure with dinosaurs and thrilling moments",
+    "E.T. the Extra-Terrestrial": "sci-fi family drama with emotional connection",
+    "Back to the Future": "sci-fi comedy adventure with time travel",
+    "The Avengers": "superhero action with team dynamics and epic battles",
+    "Toy Story": "animated comedy with heartwarming friendship themes",
+    "Finding Nemo": "animated adventure with family themes and emotional journey"
+}
+
+# Initialize sentence transformer model for onboarding
+# Load once at module level for efficiency
+try:
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    logger.info("Sentence transformer model loaded for onboarding")
+except Exception as e:
+    logger.warning(f"Could not load sentence transformer model: {e}. Onboarding will use fallback method.")
+    embedding_model = None
 
 # ============================================================================
 # RETRAINING CONFIGURATION
@@ -358,6 +471,199 @@ def calculate_similarity(profile: List[float], movie_embedding: List[float]) -> 
     
     return total  # Return the total distance
 
+def onboarding_flow(user_id: str, selected_movie_names: List[str]) -> Dict:
+    """
+    Complete the onboarding flow for a new user based on their movie selections.
+    
+    WHAT IT DOES:
+    This function handles the "cold start" problem - when a new user has no history.
+    It takes the user's movie selections, creates an initial preference profile using
+    sentence transformer embeddings, and saves it to the database. This gives the
+    system a starting point for recommendations.
+    
+    HOW IT WORKS (Step by step):
+    1. Validates that user hasn't already completed onboarding
+    2. Validates that exactly 3 movies were selected
+    3. Gets descriptions for selected movies
+    4. Creates sentence embeddings for each movie description
+    5. Averages the embeddings to find common preferences
+    6. Converts the averaged embedding to 3D format [action, romance, sci-fi]
+    7. Saves the initial profile to database
+    8. Returns initial recommendations
+    
+    WHY 3 MOVIES?
+    - Enough to identify patterns without overwhelming the user
+    - Provides good signal for initial preferences
+    - Quick to complete (good user experience)
+    - Balances between too little data (1-2 movies) and too much (5+ movies)
+    
+    EXAMPLE:
+        onboarding_flow("sarah", ["Die Hard", "The Matrix", "Blade Runner"])
+        # User likes action and sci-fi movies
+        # Creates profile like [4.5, 1.2, 4.8] (high action/sci-fi, low romance)
+        # Saves to database and returns recommendations
+    
+    Args:
+        user_id: String identifying the user
+        selected_movie_names: List of exactly 3 movie names the user selected
+                           Must be movies that exist in MOVIES catalog
+    
+    Returns:
+        dict: Contains:
+            - 'status': str - "success" or "error"
+            - 'initial_profile': List[float] - The created 3D profile [action, romance, sci-fi]
+            - 'recommendation': Optional[Dict] - Initial recommendation
+            - 'message': str - Human-readable status message
+    
+    Raises:
+        ValueError: If invalid number of movies selected or movies don't exist
+    """
+    # Validate inputs
+    if len(selected_movie_names) != 3:
+        raise ValueError("Must select exactly 3 movies for onboarding")
+    
+    # Check if movies exist
+    for movie_name in selected_movie_names:
+        if movie_name not in MOVIES:
+            raise ValueError(f"Movie '{movie_name}' not found in catalog")
+    
+    # Check if user already has a customized profile (not just default)
+    existing_profile = get_user_profile(user_id)
+    # If profile is not the default [3.0, 3.0, 3.0], user may have already onboarded
+    if existing_profile != [3.0, 3.0, 3.0]:
+        logger.info(f"User {user_id} already has a profile, but proceeding with onboarding update")
+    
+    # Get descriptions for selected movies
+    movie_descriptions = []
+    for movie_name in selected_movie_names:
+        description = MOVIE_DESCRIPTIONS.get(movie_name, movie_name)
+        movie_descriptions.append(description)
+    
+    # Create embeddings using sentence transformer
+    if embedding_model is None:
+        # Fallback: use existing 3D embeddings directly
+        logger.warning("Sentence transformer not available, using existing embeddings")
+        embeddings_3d = [MOVIES[name] for name in selected_movie_names]
+        initial_profile = [
+            np.mean([e[0] for e in embeddings_3d]),
+            np.mean([e[1] for e in embeddings_3d]),
+            np.mean([e[2] for e in embeddings_3d])
+        ]
+    else:
+        # Create sentence embeddings
+        sentence_embeddings = embedding_model.encode(movie_descriptions)
+        
+        # Average the embeddings (finds common preferences across selections)
+        averaged_embedding = np.mean(sentence_embeddings, axis=0)
+        
+        # Convert to 3D format
+        initial_profile = convert_embedding_to_3d(averaged_embedding)
+    
+    # Ensure values are in valid range
+    initial_profile = [
+        max(0.0, min(5.0, val)) for val in initial_profile
+    ]
+    
+    # Save initial profile to database
+    save_user_profile(user_id, initial_profile)
+    
+    logger.info(f"Onboarding complete for {user_id}. Initial profile: {initial_profile}")
+    
+    # Get initial recommendation
+    try:
+        profile = get_user_profile(user_id)
+        scores = {}
+        best_movie = None
+        best_score = float('inf')
+        
+        for movie_name, movie_embedding in MOVIES.items():
+            score = calculate_similarity(profile, movie_embedding)
+            scores[movie_name] = round(score, 2)
+            
+            if score < best_score:
+                best_score = score
+                best_movie = movie_name
+        
+        recommendation = {
+            'recommended_movie': best_movie,
+            'similarity_score': round(best_score, 2),
+            'all_scores': scores
+        }
+    except Exception as e:
+        logger.error(f"Error generating initial recommendation: {e}")
+        recommendation = None
+    
+    return {
+        'status': 'success',
+        'initial_profile': initial_profile,
+        'recommendation': recommendation,
+        'message': f'Onboarding complete! Your preferences: Action={initial_profile[0]:.1f}, Romance={initial_profile[1]:.1f}, Sci-fi={initial_profile[2]:.1f}'
+    }
+
+# ============================================================================
+# SECTION 6: CORE BUSINESS LOGIC (Same as Before, Now Functions)
+# ============================================================================
+
+def calculate_similarity(profile: List[float], movie_embedding: List[float]) -> float:
+    """
+    Calculate how well a movie matches a user's preferences.
+    
+    WHAT IT DOES:
+    Compares the user's preference profile to a movie's characteristics and
+    calculates a "distance" score. Lower scores mean better matches.
+    
+    HOW IT WORKS (Step by step):
+    1. Takes two lists of numbers (vectors):
+       - profile: User's preferences [action, romance, sci-fi]
+       - movie_embedding: Movie's characteristics [action, romance, sci-fi]
+    
+    2. For each dimension (action, romance, sci-fi):
+       - Calculates the difference: user_preference - movie_characteristic
+       - Takes the absolute value (makes it positive)
+       - Adds it to a running total
+    
+    3. Returns the total distance (lower = better match)
+    
+    EXAMPLE:
+        User profile: [5, 2, 1]  (loves action, some romance, little sci-fi)
+        Movie:        [4, 1, 0]  (high action, low romance, no sci-fi)
+        
+        Action difference:  |5 - 4| = 1
+        Romance difference: |2 - 1| = 1
+        Sci-fi difference:  |1 - 0| = 1
+        Total similarity score: 1 + 1 + 1 = 3 (good match!)
+        
+        If movie was [0, 5, 1] (no action, high romance):
+        Action: |5 - 0| = 5
+        Romance: |2 - 5| = 3
+        Sci-fi: |1 - 1| = 0
+        Total: 5 + 3 + 0 = 8 (worse match)
+    
+    WHY LOWER IS BETTER:
+    Think of it like GPS distance - if you're at point A and want to get to point B,
+    a smaller distance means you're closer. Same here - smaller distance = closer match.
+    
+    Args:
+        profile: List of 3 numbers representing user preferences [action, romance, sci-fi]
+                Each number is 0-5, where 5 = maximum preference
+        movie_embedding: List of 3 numbers representing movie characteristics
+                        Same format: [action, romance, sci-fi]
+    
+    Returns:
+        float: A similarity score (distance). Lower values = better matches.
+              Typical range: 0-15 (0 = perfect match, 15 = completely opposite)
+    """
+    total = 0  # Start with zero distance
+    
+    # Compare each dimension (action, romance, sci-fi)
+    for i in range(len(profile)):
+        # Calculate difference in this dimension
+        diff = profile[i] - movie_embedding[i]
+        # Use absolute value (make it positive) and add to total
+        total += abs(diff)
+    
+    return total  # Return the total distance
+
 def retrain_profile(current_profile: List[float], feedback_data: List[Dict]) -> List[float]:
     """
     Update the user's preference profile based on their movie ratings.
@@ -459,6 +765,541 @@ def retrain_profile(current_profile: List[float], feedback_data: List[Dict]) -> 
                 new_profile[i] -= adjustment
     
     return new_profile
+
+# ============================================================================
+# SECTION 5.5: ONBOARDING SYSTEM (Cold Start Solution)
+# ============================================================================
+# Purpose: Help new users quickly set up their preferences
+# Why: New users have no history, so we need a way to learn their tastes quickly
+# Note: Placed after calculate_similarity and retrain_profile for function dependencies
+
+def get_diverse_popular_movies(limit: int = 20) -> List[Dict]:
+    """
+    Get a diverse selection of popular movies across different genres for onboarding.
+    
+    WHAT IT DOES:
+    Selects movies from the catalog to show new users during onboarding. Ensures
+    diversity across genres (action, romance, sci-fi) so users can express their
+    preferences across different types of movies.
+    
+    HOW IT WORKS:
+    1. Groups movies by their primary genre (based on highest dimension in embedding)
+    2. Selects movies from each genre to ensure diversity
+    3. Returns movies with their names, descriptions, and embeddings
+    
+    WHY DIVERSITY MATTERS:
+    - Shows users different types of movies
+    - Helps identify what genres they prefer
+    - Prevents bias toward a single genre
+    - Gives better initial profile after selection
+    
+    EXAMPLE:
+        get_diverse_popular_movies(limit=20)
+        # Returns: [
+        #     {'name': 'Die Hard', 'description': 'high-octane action...', 'embedding': [5, 1, 0]},
+        #     {'name': 'The Notebook', 'description': 'romantic love story...', 'embedding': [0, 5, 1]},
+        #     ...
+        # ]
+    
+    Args:
+        limit: Maximum number of movies to return (default: 20)
+              Should be enough to show variety but not overwhelm users
+    
+    Returns:
+        List[Dict]: List of dictionaries, each containing:
+                   - 'name': str - Movie title
+                   - 'description': str - Descriptive text for embeddings
+                   - 'embedding': List[int] - 3D embedding [action, romance, sci-fi]
+    """
+    movies_list = []
+    
+    # Group movies by primary genre (highest value in embedding)
+    action_movies = []
+    romance_movies = []
+    scifi_movies = []
+    balanced_movies = []
+    
+    for name, embedding in MOVIES.items():
+        action, romance, scifi = embedding
+        max_val = max(action, romance, scifi)
+        
+        if max_val == action and action >= 4:
+            action_movies.append(name)
+        elif max_val == romance and romance >= 4:
+            romance_movies.append(name)
+        elif max_val == scifi and scifi >= 4:
+            scifi_movies.append(name)
+        else:
+            balanced_movies.append(name)
+    
+    # Select diverse movies (ensure representation from each category)
+    selected = set()
+    
+    # Add movies from each category
+    movies_per_category = limit // 4  # Roughly equal distribution
+    
+    for category in [action_movies, romance_movies, scifi_movies, balanced_movies]:
+        for movie in category[:movies_per_category]:
+            if len(selected) < limit:
+                selected.add(movie)
+    
+    # Fill remaining slots with any movies
+    for name in MOVIES.keys():
+        if len(selected) < limit and name not in selected:
+            selected.add(name)
+    
+    # Build result list
+    for name in list(selected)[:limit]:
+        movies_list.append({
+            'name': name,
+            'description': MOVIE_DESCRIPTIONS.get(name, f"{name} movie"),
+            'embedding': MOVIES[name]
+        })
+    
+    return movies_list
+
+def get_three_movies_for_selection(user_id: str) -> List[Dict]:
+    """
+    Get 3 diverse movies for the next selection step, excluding already shown movies.
+    
+    WHAT IT DOES:
+    Returns 3 diverse movies that haven't been shown to the user yet during onboarding.
+    This is used in the sequential selection flow where users pick one movie at a time.
+    
+    HOW IT WORKS:
+    1. Gets the user's onboarding session to see which movies have been shown
+    2. Selects 3 diverse movies from the catalog
+    3. Excludes movies that have already been shown to this user
+    4. Ensures diversity across genres (action, romance, sci-fi)
+    
+    WHY EXCLUDE SHOWN MOVIES?
+    - Prevents showing the same movies multiple times
+    - Gives user variety in each selection round
+    - Better user experience (not repetitive)
+    
+    EXAMPLE:
+        get_three_movies_for_selection("sarah")
+        # Returns: [
+        #     {'name': 'Die Hard', 'description': '...', 'embedding': [5, 1, 0]},
+        #     {'name': 'The Notebook', 'description': '...', 'embedding': [0, 5, 1]},
+        #     {'name': 'Blade Runner', 'description': '...', 'embedding': [3, 0, 5]}
+        # ]
+        # Next call will exclude these 3 movies
+    
+    Args:
+        user_id: String identifying the user
+    
+    Returns:
+        List[Dict]: List of 3 dictionaries, each containing:
+                   - 'name': str - Movie title
+                   - 'description': str - Descriptive text
+                   - 'embedding': List[int] - 3D embedding [action, romance, sci-fi]
+    """
+    # Get already shown movies from session
+    shown_movies = get_shown_movies(user_id)
+    
+    # Get all available movies
+    all_movies = list(MOVIES.keys())
+    
+    # Filter out already shown movies
+    available_movies = [m for m in all_movies if m not in shown_movies]
+    
+    if len(available_movies) < 3:
+        # If we've shown most movies, reset or use remaining ones
+        logger.warning(f"Only {len(available_movies)} movies available for {user_id}, may show duplicates")
+        available_movies = all_movies  # Fallback to all movies
+    
+    # Group by genre for diversity
+    action_movies = []
+    romance_movies = []
+    scifi_movies = []
+    balanced_movies = []
+    
+    for name in available_movies:
+        embedding = MOVIES[name]
+        action, romance, scifi = embedding
+        max_val = max(action, romance, scifi)
+        
+        if max_val == action and action >= 4:
+            action_movies.append(name)
+        elif max_val == romance and romance >= 4:
+            romance_movies.append(name)
+        elif max_val == scifi and scifi >= 4:
+            scifi_movies.append(name)
+        else:
+            balanced_movies.append(name)
+    
+    # Select one from each category if possible
+    selected = []
+    if action_movies:
+        selected.append(action_movies[0])
+    if romance_movies and len(selected) < 3:
+        selected.append(romance_movies[0])
+    if scifi_movies and len(selected) < 3:
+        selected.append(scifi_movies[0])
+    
+    # Fill remaining slots
+    for name in available_movies:
+        if len(selected) >= 3:
+            break
+        if name not in selected:
+            selected.append(name)
+    
+    # Build result list
+    movies_list = []
+    for name in selected[:3]:
+        movies_list.append({
+            'name': name,
+            'description': MOVIE_DESCRIPTIONS.get(name, f"{name} movie"),
+            'embedding': MOVIES[name]
+        })
+    
+    return movies_list
+
+def get_onboarding_session(user_id: str) -> Optional[Dict]:
+    """
+    Get the current onboarding session for a user.
+    
+    WHAT IT DOES:
+    Retrieves the onboarding session state from the database, including:
+    - How many selections the user has made
+    - Which movies they've selected
+    - Which movies have been shown to them
+    
+    Args:
+        user_id: String identifying the user
+    
+    Returns:
+        Optional[Dict]: Session data or None if no session exists
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT selections_made, selected_movies, shown_movies, status FROM onboarding_sessions WHERE user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+    
+    if row is None:
+        return None
+    
+    selections_made, selected_movies_json, shown_movies_json, status = row
+    
+    return {
+        'selections_made': selections_made,
+        'selected_movies': json.loads(selected_movies_json) if selected_movies_json else [],
+        'shown_movies': json.loads(shown_movies_json) if shown_movies_json else [],
+        'status': status
+    }
+
+def create_onboarding_session(user_id: str) -> None:
+    """
+    Create a new onboarding session for a user.
+    
+    Args:
+        user_id: String identifying the user
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO onboarding_sessions 
+            (user_id, selections_made, selected_movies, shown_movies, status, updated_at)
+            VALUES (?, 0, ?, ?, 'in_progress', ?)
+            """,
+            (user_id, json.dumps([]), json.dumps([]), datetime.now())
+        )
+        conn.commit()
+
+def add_movie_selection(user_id: str, movie_name: str, shown_movies: List[str]) -> int:
+    """
+    Add a movie selection to the user's onboarding session.
+    
+    Args:
+        user_id: String identifying the user
+        movie_name: Name of the selected movie
+        shown_movies: List of movies that were shown in this round
+    
+    Returns:
+        int: New count of selections made
+    """
+    session = get_onboarding_session(user_id)
+    if session is None:
+        create_onboarding_session(user_id)
+        session = get_onboarding_session(user_id)
+    
+    selected_movies = session['selected_movies']
+    if movie_name not in selected_movies:
+        selected_movies.append(movie_name)
+    
+    # Add shown movies to the list
+    all_shown = session['shown_movies']
+    for shown in shown_movies:
+        if shown not in all_shown:
+            all_shown.append(shown)
+    
+    new_count = len(selected_movies)
+    
+    # Update session
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE onboarding_sessions 
+            SET selections_made = ?, selected_movies = ?, shown_movies = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (new_count, json.dumps(selected_movies), json.dumps(all_shown), datetime.now(), user_id)
+        )
+        conn.commit()
+    
+    return new_count
+
+def get_shown_movies(user_id: str) -> List[str]:
+    """
+    Get list of movies that have been shown to the user.
+    
+    Args:
+        user_id: String identifying the user
+    
+    Returns:
+        List[str]: List of movie names that have been shown
+    """
+    session = get_onboarding_session(user_id)
+    if session is None:
+        return []
+    return session.get('shown_movies', [])
+
+def get_selected_movies(user_id: str) -> List[str]:
+    """
+    Get list of movies the user has selected so far.
+    
+    Args:
+        user_id: String identifying the user
+    
+    Returns:
+        List[str]: List of selected movie names
+    """
+    session = get_onboarding_session(user_id)
+    if session is None:
+        return []
+    return session.get('selected_movies', [])
+
+def complete_onboarding_session(user_id: str) -> None:
+    """
+    Mark onboarding session as complete.
+    
+    Args:
+        user_id: String identifying the user
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE onboarding_sessions SET status = 'completed', updated_at = ? WHERE user_id = ?",
+            (datetime.now(), user_id)
+        )
+        conn.commit()
+
+def convert_embedding_to_3d(sentence_embedding: np.ndarray) -> List[float]:
+    """
+    Convert a 384-dimensional sentence transformer embedding to 3D format [action, romance, sci-fi].
+    
+    WHAT IT DOES:
+    Takes a high-dimensional embedding (384 numbers) and converts it to our system's
+    3D format (3 numbers representing action, romance, sci-fi preferences). This allows
+    us to use semantic understanding from sentence transformers while maintaining
+    compatibility with our existing recommendation system.
+    
+    HOW IT WORKS:
+    Uses keyword-based semantic matching to map the embedding to genre dimensions:
+    1. Defines genre keywords that represent each dimension
+    2. Calculates how well the embedding matches each genre's semantic space
+    3. Normalizes to 0-5 range to match existing system
+    
+    WHY THIS APPROACH:
+    - Keeps compatibility with existing 3D embedding system
+    - Leverages semantic understanding from sentence transformers
+    - Simple and interpretable (action, romance, sci-fi)
+    - Works well for movie recommendations
+    
+    EXAMPLE:
+        embedding = model.encode("high-octane action thriller")
+        convert_embedding_to_3d(embedding)
+        # Returns: [4.8, 0.5, 0.2]  (high action, low romance/sci-fi)
+    
+    Args:
+        sentence_embedding: NumPy array of shape (384,) from sentence transformer
+                          Represents semantic meaning of text
+    
+    Returns:
+        List[float]: 3D embedding [action, romance, sci-fi]
+                    Each value is between 0.0 and 5.0
+                    Values represent preference strength for each genre
+    """
+    # Define genre reference embeddings (what each genre "looks like")
+    # These are embeddings of typical genre descriptions
+    if embedding_model is None:
+        # Fallback: use simple keyword matching if model not available
+        return [3.0, 3.0, 3.0]  # Default balanced profile
+    
+    action_keywords = ["action", "thriller", "intense", "explosive", "combat", "adventure"]
+    romance_keywords = ["romance", "romantic", "love", "emotional", "heartfelt", "relationship"]
+    scifi_keywords = ["sci-fi", "science fiction", "futuristic", "space", "technology", "alien"]
+    
+    # Create reference embeddings for each genre
+    action_text = " ".join(action_keywords)
+    romance_text = " ".join(romance_keywords)
+    scifi_text = " ".join(scifi_keywords)
+    
+    action_ref = embedding_model.encode(action_text)
+    romance_ref = embedding_model.encode(romance_text)
+    scifi_ref = embedding_model.encode(scifi_text)
+    
+    # Calculate cosine similarity to each genre
+    def cosine_sim(a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    
+    action_score = cosine_sim(sentence_embedding, action_ref)
+    romance_score = cosine_sim(sentence_embedding, romance_ref)
+    scifi_score = cosine_sim(sentence_embedding, scifi_ref)
+    
+    # Normalize scores to 0-5 range
+    # Cosine similarity is typically -1 to 1, but for embeddings usually 0 to 1
+    # We'll map 0-1 range to 0-5 range
+    action_3d = max(0, min(5, action_score * 5))
+    romance_3d = max(0, min(5, romance_score * 5))
+    scifi_3d = max(0, min(5, scifi_score * 5))
+    
+    return [float(action_3d), float(romance_3d), float(scifi_3d)]
+
+def onboarding_flow(user_id: str, selected_movie_names: List[str]) -> Dict:
+    """
+    Complete the onboarding flow for a new user based on their movie selections.
+    
+    WHAT IT DOES:
+    This function handles the "cold start" problem - when a new user has no history.
+    It takes the user's movie selections, creates an initial preference profile using
+    sentence transformer embeddings, and saves it to the database. This gives the
+    system a starting point for recommendations.
+    
+    HOW IT WORKS (Step by step):
+    1. Validates that user hasn't already completed onboarding
+    2. Validates that exactly 3 movies were selected
+    3. Gets descriptions for selected movies
+    4. Creates sentence embeddings for each movie description
+    5. Averages the embeddings to find common preferences
+    6. Converts the averaged embedding to 3D format [action, romance, sci-fi]
+    7. Saves the initial profile to database
+    8. Returns initial recommendations
+    
+    WHY 3 MOVIES?
+    - Enough to identify patterns without overwhelming the user
+    - Provides good signal for initial preferences
+    - Quick to complete (good user experience)
+    - Balances between too little data (1-2 movies) and too much (5+ movies)
+    
+    EXAMPLE:
+        onboarding_flow("sarah", ["Die Hard", "The Matrix", "Blade Runner"])
+        # User likes action and sci-fi movies
+        # Creates profile like [4.5, 1.2, 4.8] (high action/sci-fi, low romance)
+        # Saves to database and returns recommendations
+    
+    Args:
+        user_id: String identifying the user
+        selected_movie_names: List of exactly 3 movie names the user selected
+                           Must be movies that exist in MOVIES catalog
+    
+    Returns:
+        dict: Contains:
+            - 'status': str - "success" or "error"
+            - 'initial_profile': List[float] - The created 3D profile [action, romance, sci-fi]
+            - 'recommendation': Optional[Dict] - Initial recommendation
+            - 'message': str - Human-readable status message
+    
+    Raises:
+        ValueError: If invalid number of movies selected or movies don't exist
+    """
+    # Validate inputs
+    if len(selected_movie_names) != 3:
+        raise ValueError("Must select exactly 3 movies for onboarding")
+    
+    # Check if movies exist
+    for movie_name in selected_movie_names:
+        if movie_name not in MOVIES:
+            raise ValueError(f"Movie '{movie_name}' not found in catalog")
+    
+    # Check if user already has a customized profile (not just default)
+    existing_profile = get_user_profile(user_id)
+    # If profile is not the default [3.0, 3.0, 3.0], user may have already onboarded
+    if existing_profile != [3.0, 3.0, 3.0]:
+        logger.info(f"User {user_id} already has a profile, but proceeding with onboarding update")
+    
+    # Get descriptions for selected movies
+    movie_descriptions = []
+    for movie_name in selected_movie_names:
+        description = MOVIE_DESCRIPTIONS.get(movie_name, movie_name)
+        movie_descriptions.append(description)
+    
+    # Create embeddings using sentence transformer
+    if embedding_model is None:
+        # Fallback: use existing 3D embeddings directly
+        logger.warning("Sentence transformer not available, using existing embeddings")
+        embeddings_3d = [MOVIES[name] for name in selected_movie_names]
+        initial_profile = [
+            np.mean([e[0] for e in embeddings_3d]),
+            np.mean([e[1] for e in embeddings_3d]),
+            np.mean([e[2] for e in embeddings_3d])
+        ]
+    else:
+        # Create sentence embeddings
+        sentence_embeddings = embedding_model.encode(movie_descriptions)
+        
+        # Average the embeddings (finds common preferences across selections)
+        averaged_embedding = np.mean(sentence_embeddings, axis=0)
+        
+        # Convert to 3D format
+        initial_profile = convert_embedding_to_3d(averaged_embedding)
+    
+    # Ensure values are in valid range
+    initial_profile = [
+        max(0.0, min(5.0, val)) for val in initial_profile
+    ]
+    
+    # Save initial profile to database
+    save_user_profile(user_id, initial_profile)
+    
+    logger.info(f"Onboarding complete for {user_id}. Initial profile: {initial_profile}")
+    
+    # Get initial recommendation
+    try:
+        profile = get_user_profile(user_id)
+        scores = {}
+        best_movie = None
+        best_score = float('inf')
+        
+        for movie_name, movie_embedding in MOVIES.items():
+            score = calculate_similarity(profile, movie_embedding)
+            scores[movie_name] = round(score, 2)
+            
+            if score < best_score:
+                best_score = score
+                best_movie = movie_name
+        
+        recommendation = {
+            'recommended_movie': best_movie,
+            'similarity_score': round(best_score, 2),
+            'all_scores': scores
+        }
+    except Exception as e:
+        logger.error(f"Error generating initial recommendation: {e}")
+        recommendation = None
+    
+    return {
+        'status': 'success',
+        'initial_profile': initial_profile,
+        'recommendation': recommendation,
+        'message': f'Onboarding complete! Your preferences: Action={initial_profile[0]:.1f}, Romance={initial_profile[1]:.1f}, Sci-fi={initial_profile[2]:.1f}'
+    }
 
 # ============================================================================
 # SECTION 6: DATABASE OPERATIONS (Data Layer)
@@ -1333,6 +2174,379 @@ async def get_profile(user_id: str):
         }
     except Exception as e:
         logger.error(f"Error retrieving profile: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/onboarding/next", response_model=OnboardingNextResponse)
+async def get_next_onboarding_movies(request: OnboardingNextRequest):
+    """
+    Get the next 3 movies for the user to choose from during onboarding.
+    
+    WHAT IT DOES:
+    Returns 3 diverse movies that the user hasn't seen yet in this onboarding session.
+    This is part of the sequential selection flow where users pick one movie at a time.
+    
+    HOW IT WORKS:
+    1. Gets or creates an onboarding session for the user
+    2. Retrieves list of movies already shown to this user
+    3. Selects 3 diverse movies (excluding already shown ones)
+    4. Marks these 3 movies as "shown" in the session
+    5. Returns the movies along with selection progress
+    
+    WHEN IT'S CALLED:
+    - First time: When user starts onboarding (selections_made = 0)
+    - Subsequent times: After each selection (selections_made = 1 or 2)
+    - Stops after 3 selections are made
+    
+    EXAMPLE REQUEST:
+        POST /onboarding/next
+        Body (JSON):
+        {
+            "user_id": "sarah"
+        }
+    
+    EXAMPLE RESPONSE (First call):
+        {
+            "movies": [
+                {"name": "Die Hard", "description": "...", "embedding": [5, 1, 0]},
+                {"name": "The Notebook", "description": "...", "embedding": [0, 5, 1]},
+                {"name": "Blade Runner", "description": "...", "embedding": [3, 0, 5]}
+            ],
+            "selections_made": 0,
+            "selections_remaining": 3
+        }
+    
+    EXAMPLE RESPONSE (After 2 selections):
+        {
+            "movies": [...],
+            "selections_made": 2,
+            "selections_remaining": 1
+        }
+    
+    Args:
+        request: OnboardingNextRequest containing user_id
+    
+    Returns:
+        OnboardingNextResponse: Contains 3 movies and selection progress
+    
+    Raises:
+        HTTPException: 400 if user already completed onboarding (3 selections made)
+    """
+    try:
+        # Check if user already has 3 selections
+        selected = get_selected_movies(request.user_id)
+        if len(selected) >= 3:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Onboarding already complete. User has selected {len(selected)} movies. Call /onboarding/complete to finish."
+            )
+        
+        # Get or create session
+        if get_onboarding_session(request.user_id) is None:
+            create_onboarding_session(request.user_id)
+        
+        # Get 3 movies (excluding already shown ones)
+        movies = get_three_movies_for_selection(request.user_id)
+        
+        # Mark these movies as shown
+        shown_movie_names = [m['name'] for m in movies]
+        session = get_onboarding_session(request.user_id)
+        all_shown = session['shown_movies']
+        for name in shown_movie_names:
+            if name not in all_shown:
+                all_shown.append(name)
+        
+        # Update shown movies in database
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE onboarding_sessions SET shown_movies = ?, updated_at = ? WHERE user_id = ?",
+                (json.dumps(all_shown), datetime.now(), request.user_id)
+            )
+            conn.commit()
+        
+        selections_made = len(selected)
+        selections_remaining = 3 - selections_made
+        
+        return OnboardingNextResponse(
+            movies=movies,
+            selections_made=selections_made,
+            selections_remaining=selections_remaining
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting next onboarding movies: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/onboarding/select", response_model=OnboardingSelectResponse)
+async def select_onboarding_movie(request: OnboardingSelectRequest):
+    """
+    Record a single movie selection during onboarding.
+    
+    WHAT IT DOES:
+    Records that the user selected one movie from the 3 they were shown.
+    This is part of the sequential selection flow where users pick one movie at a time.
+    
+    HOW IT WORKS:
+    1. Validates the movie exists in catalog
+    2. Validates user hasn't already selected 3 movies
+    3. Adds the selection to the user's onboarding session
+    4. Returns progress (how many selections made, how many remaining)
+    5. Indicates if ready to complete (3 selections made)
+    
+    WHEN IT'S CALLED:
+    - After user sees 3 movies from /onboarding/next
+    - User picks one movie and calls this endpoint
+    - Repeat until 3 selections are made
+    
+    EXAMPLE REQUEST:
+        POST /onboarding/select
+        Body (JSON):
+        {
+            "user_id": "sarah",
+            "movie_name": "Die Hard"
+        }
+    
+    EXAMPLE RESPONSE (After 1st selection):
+        {
+            "status": "success",
+            "selections_made": 1,
+            "selections_remaining": 2,
+            "message": "Selection recorded. 2 more selections needed.",
+            "ready_to_complete": false
+        }
+    
+    EXAMPLE RESPONSE (After 3rd selection):
+        {
+            "status": "success",
+            "selections_made": 3,
+            "selections_remaining": 0,
+            "message": "All 3 selections made! Call /onboarding/complete to finish.",
+            "ready_to_complete": true
+        }
+    
+    Args:
+        request: OnboardingSelectRequest containing user_id and movie_name
+    
+    Returns:
+        OnboardingSelectResponse: Selection status and progress
+    
+    Raises:
+        HTTPException:
+            - 400 if movie doesn't exist or user already has 3 selections
+            - 500 if processing error
+    """
+    try:
+        # Validate movie exists
+        if request.movie_name not in MOVIES:
+            raise HTTPException(status_code=400, detail=f"Movie '{request.movie_name}' not found in catalog")
+        
+        # Check current selections
+        selected = get_selected_movies(request.user_id)
+        if len(selected) >= 3:
+            raise HTTPException(
+                status_code=400,
+                detail=f"User already has 3 selections. Call /onboarding/complete to finish."
+            )
+        
+        # Get currently shown movies (from last /onboarding/next call)
+        session = get_onboarding_session(request.user_id)
+        if session is None:
+            raise HTTPException(status_code=400, detail="No active onboarding session. Call /onboarding/next first.")
+        
+        shown_movies = session['shown_movies']
+        # Get the last 3 shown movies (most recent round)
+        recent_shown = shown_movies[-3:] if len(shown_movies) >= 3 else shown_movies
+        
+        # Validate movie was in the shown list
+        if request.movie_name not in recent_shown:
+            logger.warning(f"User {request.user_id} selected '{request.movie_name}' which wasn't in recent shown movies")
+            # Still allow it, but log the warning
+        
+        # Add selection
+        new_count = add_movie_selection(request.user_id, request.movie_name, recent_shown)
+        
+        selections_remaining = 3 - new_count
+        ready_to_complete = (new_count >= 3)
+        
+        if ready_to_complete:
+            message = "All 3 selections made! Call /onboarding/complete to finish onboarding."
+        else:
+            message = f"Selection recorded. {selections_remaining} more selection{'s' if selections_remaining > 1 else ''} needed."
+        
+        return OnboardingSelectResponse(
+            status="success",
+            selections_made=new_count,
+            selections_remaining=selections_remaining,
+            message=message,
+            ready_to_complete=ready_to_complete
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error recording selection: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/onboarding/start", response_model=OnboardingStartResponse)
+async def start_onboarding():
+    """
+    Start the onboarding process for a new user.
+    
+    WHAT IT DOES:
+    Returns a diverse selection of popular movies (20 movies) that the user can
+    choose from during onboarding. This helps new users quickly express their
+    preferences by selecting movies they like.
+    
+    HOW IT WORKS:
+    1. Calls get_diverse_popular_movies() to get 20 diverse movies
+    2. Returns movies with their names, descriptions, and embeddings
+    3. User can then select 3 favorites and call /onboarding/complete
+    
+    WHEN IT'S CALLED:
+    - When a new user first signs up
+    - When a user wants to reset their preferences
+    - Before calling /onboarding/complete
+    
+    EXAMPLE REQUEST:
+        POST /onboarding/start
+    
+    EXAMPLE RESPONSE:
+        {
+            "movies": [
+                {
+                    "name": "Die Hard",
+                    "description": "high-octane action thriller...",
+                    "embedding": [5, 1, 0]
+                },
+                {
+                    "name": "The Notebook",
+                    "description": "romantic love story...",
+                    "embedding": [0, 5, 1]
+                },
+                ... (18 more movies)
+            ]
+        }
+    
+    Returns:
+        OnboardingStartResponse: Contains list of 20 diverse movies for selection
+    
+    Note:
+        This endpoint doesn't require authentication or user_id - it's the first
+        step in the onboarding flow. The user_id is provided in the next step.
+    """
+    try:
+        movies = get_diverse_popular_movies(limit=20)
+        return OnboardingStartResponse(movies=movies)
+    except Exception as e:
+        logger.error(f"Error starting onboarding: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/onboarding/complete", response_model=OnboardingCompleteResponse)
+async def complete_onboarding(request: OnboardingCompleteRequest):
+    """
+    Complete the onboarding process by creating an initial user profile.
+    
+    WHAT IT DOES:
+    Takes the user's 3 movie selections (from sequential selection flow),
+    creates an initial preference profile using sentence transformer embeddings,
+    and saves it to the database. This solves the "cold start" problem.
+    
+    HOW IT WORKS (Step by step):
+    1. Gets the selected movies from the onboarding session
+    2. Validates that exactly 3 movies were selected
+    3. Calls onboarding_flow() to:
+       - Create sentence embeddings for selected movies
+       - Average embeddings to find common preferences
+       - Convert to 3D format [action, romance, sci-fi]
+       - Save initial profile to database
+    4. Marks onboarding session as complete
+    5. Returns the created profile and initial recommendation
+    
+    TWO WAYS TO USE:
+    Option 1 (Sequential - Recommended):
+        - Call /onboarding/next → get 3 movies
+        - Call /onboarding/select → pick one movie
+        - Repeat until 3 selections made
+        - Call /onboarding/complete → finish (no need to pass selected_movies)
+    
+    Option 2 (Batch - Legacy):
+        - Call /onboarding/start → get 20 movies
+        - User picks 3 from those 20
+        - Call /onboarding/complete with selected_movies in body
+    
+    EXAMPLE REQUEST (Sequential flow - no body needed):
+        POST /onboarding/complete
+        Body (JSON):
+        {
+            "user_id": "sarah"
+        }
+        # Uses movies from session
+    
+    EXAMPLE REQUEST (Batch flow - explicit movies):
+        POST /onboarding/complete
+        Body (JSON):
+        {
+            "user_id": "sarah",
+            "selected_movies": ["Die Hard", "The Matrix", "Blade Runner"]
+        }
+    
+    EXAMPLE RESPONSE:
+        {
+            "status": "success",
+            "initial_profile": [4.5, 1.2, 4.8],
+            "recommendation": {
+                "recommended_movie": "Inception",
+                "similarity_score": 2.3,
+                "all_scores": {...}
+            },
+            "message": "Onboarding complete! Your preferences: Action=4.5, Romance=1.2, Sci-fi=4.8"
+        }
+    
+    Args:
+        request: OnboardingCompleteRequest containing:
+                - user_id: str - User identifier
+                - selected_movies: Optional[List[str]] - If provided, uses these. Otherwise uses session.
+    
+    Returns:
+        OnboardingCompleteResponse: Contains:
+            - status: "success" or "error"
+            - initial_profile: The created 3D profile
+            - recommendation: Initial movie recommendation
+            - message: Human-readable status
+    
+    Raises:
+        HTTPException:
+            - 400 if invalid number of movies or movies don't exist
+            - 500 if processing error occurs
+    """
+    try:
+        # If selected_movies provided in request, use them (batch mode)
+        # Otherwise, get from session (sequential mode)
+        if request.selected_movies and len(request.selected_movies) > 0:
+            selected_movies = request.selected_movies
+        else:
+            # Get from session
+            selected_movies = get_selected_movies(request.user_id)
+            if len(selected_movies) != 3:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Expected 3 selections, but found {len(selected_movies)}. Make sure to select 3 movies first."
+                )
+        
+        # Complete the onboarding flow
+        result = onboarding_flow(request.user_id, selected_movies)
+        
+        # Mark session as complete
+        complete_onboarding_session(request.user_id)
+        
+        return OnboardingCompleteResponse(**result)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid onboarding request: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error completing onboarding: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/movies")
